@@ -1,2 +1,2 @@
 # IRUO
-IRUO projekt
+IRUO projekt Algebra Bernays
