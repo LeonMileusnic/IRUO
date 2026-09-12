@@ -1,0 +1,111 @@
+---
+# Auto-mounts each developer's own Swift container (object storage, used for
+# Moodle backups) on their Moodle VMs using rclone, authenticated with the
+# per-developer application credential created in openstack/iam.tf. Previously
+# Swift was only reachable from the admin workstation via `openstack object
+# create` in scripts/backup-openstack.sh - never mounted on the VM itself,
+# which did not satisfy "both storage types must be automatically mounted".
+- name: Mount developer Swift container as object storage
+  hosts: moodle
+  become: true
+
+  vars:
+    object_mount_point: /data/objectstore
+    rclone_config_dir: /etc/rclone
+    rclone_config_file: /etc/rclone/techsprint.conf
+
+  pre_tasks:
+    - name: Verify OpenStack auth URL was supplied
+      ansible.builtin.assert:
+        that:
+          - os_auth_url is defined
+          - os_auth_url | length > 0
+        fail_msg: "Pass -e os_auth_url=$OS_AUTH_URL (and optionally os_region_name) when running this playbook."
+
+  tasks:
+    - name: Install EPEL repository (provides rclone on RHEL/Rocky)
+      ansible.builtin.dnf:
+        name: epel-release
+        state: present
+
+    - name: Install rclone and FUSE
+      ansible.builtin.dnf:
+        name:
+          - rclone
+          - fuse3
+        state: present
+
+    - name: Create rclone config directory
+      ansible.builtin.file:
+        path: "{{ rclone_config_dir }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0700"
+
+    - name: Write rclone Swift remote configuration
+      ansible.builtin.copy:
+        dest: "{{ rclone_config_file }}"
+        owner: root
+        group: root
+        mode: "0600"
+        content: |
+          [swift]
+          type = swift
+          env_auth = false
+          auth_version = 3
+          auth = {{ os_auth_url }}
+          region = {{ os_region_name | default('regionOne') }}
+          application_credential_id = {{ swift_app_credential_id }}
+          application_credential_secret = {{ swift_app_credential_secret }}
+      no_log: true
+
+    - name: Create object storage mount point
+      ansible.builtin.file:
+        path: "{{ object_mount_point }}"
+        state: directory
+        owner: apache
+        group: apache
+        mode: "0770"
+
+    - name: Allow non-root FUSE mounts with allow_other
+      ansible.builtin.lineinfile:
+        path: /etc/fuse.conf
+        line: "user_allow_other"
+        create: true
+        state: present
+
+    - name: Install systemd unit for the Swift mount
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/techsprint-objectstore.service
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          [Unit]
+          Description=TechSprint Swift object storage mount ({{ swift_container }})
+          After=network-online.target
+          Wants=network-online.target
+          AssertPathIsDirectory={{ object_mount_point }}
+
+          [Service]
+          Type=notify
+          ExecStart=/usr/bin/rclone mount swift:{{ swift_container }} {{ object_mount_point }} \
+            --config {{ rclone_config_file }} \
+            --allow-other \
+            --dir-cache-time 30s \
+            --vfs-cache-mode writes \
+            --uid 0 --gid 0 --umask 002
+          ExecStop=/bin/fusermount3 -u {{ object_mount_point }}
+          Restart=on-failure
+          RestartSec=10
+
+          [Install]
+          WantedBy=multi-user.target
+
+    - name: Enable and start the Swift mount service
+      ansible.builtin.systemd:
+        name: techsprint-objectstore.service
+        daemon_reload: true
+        enabled: true
+        state: started
